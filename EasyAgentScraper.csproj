@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk;Microsoft.NET.Sdk.Publish">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+	  <PackageReference Include="Azure.AI.Inference" Version="1.0.0-beta.5" />
+	  <PackageReference Include="Azure.AI.OpenAI" Version="2.1.0" />
+	  <PackageReference Include="Azure.AI.Projects" Version="1.0.0-beta.10" />
+	  <PackageReference Include="Azure.Core" Version="1.47.0" />
+	  <PackageReference Include="Azure.Identity" Version="1.14.2" />
+	  <PackageReference Include="HtmlAgilityPack" Version="1.12.1" />
+	  <PackageReference Include="Microsoft.Azure.Cosmos" Version="3.49.0" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration" Version="9.0.7" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration.Binder" Version="9.0.7" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="9.0.5" />
+	  <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.5" />
+	  <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Settings.job">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <Target Name="ZipOutputFiles" AfterTargets="Build">
+    <PropertyGroup>
+      <ZipFileName>$(MSBuildProjectDirectory)\EasyAgentScraper.zip</ZipFileName>
+    </PropertyGroup>
+    
+    <Message Text="Creating zip file: $(ZipFileName)" Importance="high" />
+    
+    <ZipDirectory SourceDirectory="$(OutputPath)" DestinationFile="$(ZipFileName)" Overwrite="true" />
+  </Target>
+</Project>

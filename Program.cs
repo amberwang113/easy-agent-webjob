@@ -1,6 +1,6 @@
 ﻿using Azure.Identity;
 using Microsoft.Extensions.Configuration;
-using Azure.AI.OpenAI;
+using Azure.Core;
 
 class Program
 {
@@ -13,7 +13,6 @@ class Program
         var config = new ConfigurationBuilder()
              .SetBasePath(Directory.GetCurrentDirectory())
              .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-             .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: true)
              .AddEnvironmentVariables()
              .Build();
 
@@ -31,21 +30,16 @@ class Program
         Console.WriteLine($"Website Hostname: {chatbotConfig.WEBSITE_HOSTNAME}");
         Console.WriteLine($"Site Name: {chatbotConfig.WEBSITE_SITE_NAME}");
 
-        // Initialize Azure credentials
-        var credential = new DefaultAzureCredential();
-        Console.WriteLine("Azure credentials initialized.");
-
-        // Use the strongly typed configuration for other services
-        string databaseName = !string.IsNullOrEmpty(chatbotConfig.WEBSITE_EASYAGENT_SITECONTEXT_DB_NAME) 
-            ? chatbotConfig.WEBSITE_EASYAGENT_SITECONTEXT_DB_NAME 
-            : chatbotConfig.WEBSITE_SITE_NAME;
+        // Initialize Azure credentials based on configuration
+        TokenCredential credential = !string.IsNullOrEmpty(chatbotConfig.WEBSITE_MANAGED_CLIENT_ID)
+            ? new ManagedIdentityCredential(chatbotConfig.WEBSITE_MANAGED_CLIENT_ID)
+            : new DefaultAzureCredential();
             
-        string containerName = "base";
+        Console.WriteLine(!string.IsNullOrEmpty(chatbotConfig.WEBSITE_MANAGED_CLIENT_ID)
+            ? "Azure credentials initialized with Managed Identity."
+            : "Azure credentials initialized with DefaultAzureCredential.");
 
-        Console.WriteLine($"Database will be: {databaseName}");
-        Console.WriteLine($"Container will be: {containerName}");
-
-        // Example: Validate that required configuration is present
+        // Validate that required configuration is present
         if (string.IsNullOrEmpty(chatbotConfig.WEBSITE_EASYAGENT_FOUNDRY_ENDPOINT))
         {
             Console.WriteLine("Warning: WEBSITE_EASYAGENT_FOUNDRY_ENDPOINT is not configured");
@@ -58,10 +52,6 @@ class Program
 
         try 
         {
-            Console.WriteLine("Initializing Azure OpenAI client...");
-            var openAIClient = new AzureOpenAIClient(new Uri(chatbotConfig.WEBSITE_EASYAGENT_FOUNDRY_ENDPOINT), credential);
-            Console.WriteLine("Azure OpenAI client initialized successfully.");
-
             Console.WriteLine("Initializing Database Service...");
             var dbService = new DBService(chatbotConfig, credential);
             Console.WriteLine("Starting database setup...");

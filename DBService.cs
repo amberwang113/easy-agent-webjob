@@ -1,7 +1,6 @@
 ﻿using System.Collections.ObjectModel;
 using Azure.AI.Projects;
 using Azure.Core;
-using Azure.Identity;
 using Microsoft.Azure.Cosmos;
 using Newtonsoft.Json;
 
@@ -12,21 +11,21 @@ public class DBService
     private string databaseId;
     private string containerId;
     private ChatbotConfiguration config;
-    private DefaultAzureCredential credential;
+    private TokenCredential credential;
 
     public class TextEmbeddingItem
     {
         [JsonProperty("id")]
-        public string Id { get; set; }
+        public string Id { get; set; } = string.Empty;
 
         // Url and partitionKey for the CosmosDb
-        public string Url { get; set; }
+        public string Url { get; set; } = string.Empty;
 
-        public string Text { get; set; }
+        public string Text { get; set; } = string.Empty;
 
-        public float[] Embedding { get; set; }
+        public float[] Embedding { get; set; } = [];
 
-        public string TextHash { get; set; }
+        public string TextHash { get; set; } = string.Empty;
 
         public override string ToString()
         {
@@ -34,17 +33,20 @@ public class DBService
         }
     }
 
-    public DBService(ChatbotConfiguration config, DefaultAzureCredential credential)
+    public DBService(ChatbotConfiguration config, TokenCredential credential)
     {
         this.config = config;
+        
+        // Use ManagedIdentityCredential if WEBSITE_MANAGED_CLIENT_ID is set, otherwise use the provided DefaultAzureCredential
+        this.credential = credential;
+        
         // Use the database name from config, or fall back to site name if not specified
         this.databaseId = string.IsNullOrEmpty(config.WEBSITE_EASYAGENT_SITECONTEXT_DB_NAME) 
-            ? $"{config.WEBSITE_SITE_NAME}" 
+            ? config.WEBSITE_SITE_NAME + "-EasyAgent" 
             : config.WEBSITE_EASYAGENT_SITECONTEXT_DB_NAME;
         
         this.containerId = "base";
-        this.cosmosClient = new CosmosClient(config.WEBSITE_EASYAGENT_SITECONTEXT_DB_ENDPOINT, credential);
-        this.credential = credential;
+        this.cosmosClient = new CosmosClient(config.WEBSITE_EASYAGENT_SITECONTEXT_DB_ENDPOINT, this.credential);
     }
 
     public async Task CreateDatabaseAndFreshContainerAsync()
@@ -58,12 +60,9 @@ public class DBService
         {
             await container.DeleteContainerAsync();
         }
-        catch (Exception e)
+        catch (CosmosException e) when (e.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
-            if (e.Message.Contains("NotFound"))
-            {
-                Console.WriteLine($"No existing container. Creating a new one.");
-            }
+            Console.WriteLine("No existing container. Creating a new one.");
         }
 
         // Create a new empty container with vector index
@@ -145,7 +144,7 @@ public class DBService
 
         var eClient = aClient.GetAzureOpenAIEmbeddingClient(deploymentName: config.WEBSITE_EASYAGENT_FOUNDRY_EMBEDDING_MODEL);
 
-        var embedding = eClient.GenerateEmbedding(sentence);
+        var embedding = await eClient.GenerateEmbeddingAsync(sentence);
 
         return embedding.Value.ToFloats().ToArray();
     }

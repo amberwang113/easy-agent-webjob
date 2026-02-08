@@ -3,8 +3,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Security.Cryptography;
 using static DBService;
-using Azure.AI.Projects;
-using Azure.Identity;
+using Azure.Core;
 
 public class WebsiteScrapingService
 {
@@ -15,9 +14,12 @@ public class WebsiteScrapingService
 
     private ChatbotConfiguration config;
 
-    private DefaultAzureCredential credential;
+    private TokenCredential credential;
 
-    public WebsiteScrapingService(ChatbotConfiguration config, DBService db, DefaultAzureCredential credential)
+    private string? accessToken;
+    private DateTimeOffset tokenExpiry = DateTimeOffset.MinValue;
+
+    public WebsiteScrapingService(ChatbotConfiguration config, DBService db, TokenCredential credential)
     {
         this.httpClient = new HttpClient();
         this.db = db;
@@ -25,9 +27,36 @@ public class WebsiteScrapingService
         this.credential = credential;
     }
 
+    private async Task EnsureAuthenticatedAsync()
+    {
+        if (string.IsNullOrEmpty(config.WEBSITE_EASYAGENT_EASYAUTH_AUDIENCE))
+        {
+            return;
+        }
+
+        if (accessToken != null && DateTimeOffset.UtcNow < tokenExpiry.AddMinutes(-5))
+        {
+            return;
+        }
+
+        var scope = config.WEBSITE_EASYAGENT_EASYAUTH_AUDIENCE.TrimEnd('/') + "/.default";
+        var tokenRequestContext = new TokenRequestContext([scope]);
+        var token = await credential.GetTokenAsync(tokenRequestContext, CancellationToken.None);
+
+        accessToken = token.Token;
+        tokenExpiry = token.ExpiresOn;
+
+        httpClient.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
+
+        Console.WriteLine("Acquired Easy Auth access token for scraping.");
+    }
+
     public async Task KickOffScraping(string rootUrl, int maxDepth = 10)
     {
         Uri uri = new Uri(rootUrl);
+
+        await EnsureAuthenticatedAsync();
 
         await ScrapeWebsiteAsync(rootUrl, maxDepth);
     }
@@ -43,6 +72,8 @@ public class WebsiteScrapingService
 
         try
         {
+            await EnsureAuthenticatedAsync();
+
             var response = await httpClient.GetAsync(url);
 
             if (!response.IsSuccessStatusCode)
@@ -57,7 +88,7 @@ public class WebsiteScrapingService
 
             await ExtractChunks(url, htmlDocument.DocumentNode);
 
-            var linkNodes = ExtractLinks(htmlDocument.DocumentNode, url); ;
+            var linkNodes = ExtractLinks(htmlDocument.DocumentNode, url);
 
             foreach (var link in linkNodes)
             {
@@ -68,14 +99,12 @@ public class WebsiteScrapingService
         {
             Console.WriteLine($"Error scraping {url}: {ex.Message}");
         }
-        finally
-        {
-        }
     }
 
     private IEnumerable<string> ExtractLinks(HtmlNode documentNode, string baseUrl)
     {
         var links = new List<string>();
+        var baseHost = new Uri(baseUrl).Host;
         var linkNodes = documentNode.SelectNodes("//a[@href]");
         if (linkNodes != null)
         {
@@ -85,7 +114,12 @@ public class WebsiteScrapingService
                 if (!string.IsNullOrEmpty(href))
                 {
                     var absoluteUrl = GetAbsoluteUrl(baseUrl, href);
-                    links.Add(absoluteUrl);
+                    // Only follow links on the same host to avoid scraping external sites
+                    if (Uri.TryCreate(absoluteUrl, UriKind.Absolute, out var parsedUri)
+                        && string.Equals(parsedUri.Host, baseHost, StringComparison.OrdinalIgnoreCase))
+                    {
+                        links.Add(absoluteUrl);
+                    }
                 }
             }
         }
@@ -129,10 +163,11 @@ public class WebsiteScrapingService
 
                 if (combinedText.Length > 7000 * 4)
                 {
-                    Console.WriteLine($"Given chunk is too long, breaking down.");
-                    int breakPoint = Math.Min(combinedText.IndexOf('.', 5000), 7000);
-                    await StoreChunk(url, combinedText.Substring(0, breakPoint));
-                    await StoreChunk(url, combinedText.Substring(breakPoint));
+                    Console.WriteLine("Given chunk is too long, breaking down.");
+                    int dotIndex = combinedText.IndexOf('.', 5000);
+                    int breakPoint = dotIndex >= 0 ? Math.Min(dotIndex + 1, 7000) : 7000;
+                    await StoreChunk(url, combinedText[..breakPoint]);
+                    await StoreChunk(url, combinedText[breakPoint..]);
                 }
                 else
                 {
@@ -195,13 +230,10 @@ public class WebsiteScrapingService
     }
 
     // Hash is used to check for duplicated text
-    private string ComputeHash(string text)
+    private static string ComputeHash(string text)
     {
-        using (SHA256 sha256 = SHA256.Create())
-        {
-            byte[] hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(text));
-            return BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
-        }
+        byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(text));
+        return Convert.ToHexStringLower(hashBytes);
     }
 
     private string CleanWhitespace(string input)
@@ -209,14 +241,8 @@ public class WebsiteScrapingService
         return Regex.Replace(input, @"\s+", " ").Trim();
     }
 
-    public async Task<float[]> GenerateEmbedding(string sentence)
+    private async Task<float[]> GenerateEmbedding(string sentence)
     {
-        var aClient = new AIProjectClient(new Uri(config.WEBSITE_EASYAGENT_FOUNDRY_ENDPOINT), credential);
-
-        var eClient = aClient.GetAzureOpenAIEmbeddingClient(deploymentName: config.WEBSITE_EASYAGENT_FOUNDRY_EMBEDDING_MODEL);
-
-        var embedding = eClient.GenerateEmbedding(sentence);
-
-        return embedding.Value.ToFloats().ToArray();
+        return await db.GenerateEmbedding(sentence);
     }
 }
