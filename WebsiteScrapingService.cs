@@ -21,7 +21,10 @@ public class WebsiteScrapingService
 
     public WebsiteScrapingService(ChatbotConfiguration config, DBService db, TokenCredential credential)
     {
-        this.httpClient = new HttpClient();
+        this.httpClient = new HttpClient(new HttpClientHandler
+        {
+            AllowAutoRedirect = false
+        });
         this.db = db;
         this.config = config;
         this.credential = credential;
@@ -31,6 +34,7 @@ public class WebsiteScrapingService
     {
         if (string.IsNullOrEmpty(config.WEBSITE_EASYAGENT_EASYAUTH_AUDIENCE))
         {
+            Console.WriteLine("EasyAuth: No audience configured — skipping authentication.");
             return;
         }
 
@@ -40,6 +44,7 @@ public class WebsiteScrapingService
         }
 
         var scope = config.WEBSITE_EASYAGENT_EASYAUTH_AUDIENCE.TrimEnd('/') + "/.default";
+        Console.WriteLine($"EasyAuth: Requesting token with scope '{scope}'...");
         var tokenRequestContext = new TokenRequestContext([scope]);
         var token = await credential.GetTokenAsync(tokenRequestContext, CancellationToken.None);
 
@@ -49,16 +54,26 @@ public class WebsiteScrapingService
         httpClient.DefaultRequestHeaders.Authorization =
             new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
 
-        Console.WriteLine("Acquired Easy Auth access token for scraping.");
+        Console.WriteLine($"EasyAuth: Acquired access token (expires {tokenExpiry:u}).");
+    }
+
+    private async Task ForceRefreshTokenAsync()
+    {
+        Console.WriteLine("EasyAuth: Forcing token refresh...");
+        accessToken = null;
+        tokenExpiry = DateTimeOffset.MinValue;
+        await EnsureAuthenticatedAsync();
     }
 
     public async Task KickOffScraping(string rootUrl, int maxDepth = 10)
     {
+        Console.WriteLine($"KickOffScraping: Starting with root URL '{rootUrl}', max depth {maxDepth}.");
         Uri uri = new Uri(rootUrl);
 
         await EnsureAuthenticatedAsync();
 
         await ScrapeWebsiteAsync(rootUrl, maxDepth);
+        Console.WriteLine($"KickOffScraping: Finished. Total URLs visited: {visitedUrls.Count}.");
     }
 
     private async Task ScrapeWebsiteAsync(string url, int maxDepth, int currentDepth = 0)
@@ -74,21 +89,56 @@ public class WebsiteScrapingService
         {
             await EnsureAuthenticatedAsync();
 
+            Console.WriteLine($"Scrape: GET {url}");
             var response = await httpClient.GetAsync(url);
+            Console.WriteLine($"Scrape: Response {(int)response.StatusCode} {response.StatusCode} for {url}");
+
+            if ((response.StatusCode == System.Net.HttpStatusCode.Unauthorized ||
+                 response.StatusCode == System.Net.HttpStatusCode.Forbidden) &&
+                !string.IsNullOrEmpty(config.WEBSITE_EASYAGENT_EASYAUTH_AUDIENCE))
+            {
+                Console.WriteLine($"Scrape: Got {response.StatusCode}, forcing token refresh and retrying...");
+                await ForceRefreshTokenAsync();
+                response = await httpClient.GetAsync(url);
+                Console.WriteLine($"Scrape: Retry response {(int)response.StatusCode} {response.StatusCode} for {url}");
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.Redirect ||
+                response.StatusCode == System.Net.HttpStatusCode.MovedPermanently)
+            {
+                var location = response.Headers.Location?.ToString() ?? "";
+                Console.WriteLine($"Scrape: Redirect location: '{location}'");
+                if (location.Contains("login.microsoftonline.com") || location.Contains("/.auth/login"))
+                {
+                    Console.WriteLine($"Scrape: EasyAuth redirect detected for {url} — token may be invalid.");
+                    return;
+                }
+
+                // Follow legitimate redirects (e.g., http→https, www normalization)
+                if (!string.IsNullOrEmpty(location))
+                {
+                    var absoluteRedirect = GetAbsoluteUrl(url, location);
+                    Console.WriteLine($"Scrape: Following legitimate redirect to '{absoluteRedirect}'");
+                    await ScrapeWebsiteAsync(absoluteRedirect, maxDepth, currentDepth);
+                    return;
+                }
+            }
 
             if (!response.IsSuccessStatusCode)
             {
-                Console.WriteLine($"Failed to retrieve {url}");
+                Console.WriteLine($"Scrape: Failed to retrieve {url}: {response.StatusCode}");
                 return;
             }
 
             var responseBody = await response.Content.ReadAsStringAsync();
+            Console.WriteLine($"Scrape: Received {responseBody.Length} characters from {url}");
             var htmlDocument = new HtmlDocument();
             htmlDocument.LoadHtml(responseBody);
 
             await ExtractChunks(url, htmlDocument.DocumentNode);
 
             var linkNodes = ExtractLinks(htmlDocument.DocumentNode, url);
+            Console.WriteLine($"Scrape: Found {linkNodes.Count()} links on {url}");
 
             foreach (var link in linkNodes)
             {
@@ -97,7 +147,8 @@ public class WebsiteScrapingService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error scraping {url}: {ex.Message}");
+            Console.WriteLine($"Scrape: Error scraping {url}: {ex.Message}");
+            Console.WriteLine($"Scrape: Stack trace: {ex.StackTrace}");
         }
     }
 
@@ -113,7 +164,7 @@ public class WebsiteScrapingService
                 var href = linkNode.GetAttributeValue("href", string.Empty);
                 if (!string.IsNullOrEmpty(href))
                 {
-                    var absoluteUrl = GetAbsoluteUrl(baseUrl, href);
+                    var absoluteUrl = NormalizeUrl(GetAbsoluteUrl(baseUrl, href));
                     // Only follow links on the same host to avoid scraping external sites
                     if (Uri.TryCreate(absoluteUrl, UriKind.Absolute, out var parsedUri)
                         && string.Equals(parsedUri.Host, baseHost, StringComparison.OrdinalIgnoreCase))
@@ -124,6 +175,17 @@ public class WebsiteScrapingService
             }
         }
         return links;
+    }
+
+    private static string NormalizeUrl(string url)
+    {
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            // Strip fragment and trailing slash
+            var normalized = uri.GetLeftPart(UriPartial.Query).TrimEnd('/');
+            return normalized;
+        }
+        return url;
     }
 
     private string GetAbsoluteUrl(string baseUrl, string relativeUrl)
@@ -187,17 +249,24 @@ public class WebsiteScrapingService
 
             if (currentNode.Name == "p" || currentNode.Name == "div")
             {
-                var text = HtmlEntity.DeEntitize(currentNode.InnerText.Trim());
-                if (!string.IsNullOrEmpty(text) && text.Any(char.IsLetterOrDigit))
+                // Only extract text from leaf-level content nodes (no nested p/div children)
+                var hasNestedContentNodes = currentNode.ChildNodes.Any(c => c.Name == "p" || c.Name == "div");
+                if (!hasNestedContentNodes)
                 {
-                    var cleanedText = CleanWhitespace(text);
-                    accumulatedText.Add(cleanedText);
-
-                    var wordCount = accumulatedText.Sum(t => t.Split(' ').Length);
-                    if (wordCount >= 200)
+                    var text = HtmlEntity.DeEntitize(currentNode.InnerText.Trim());
+                    if (!string.IsNullOrEmpty(text) && text.Any(char.IsLetterOrDigit))
                     {
-                        await StoreAccumulatedChunksAsync();
+                        var cleanedText = CleanWhitespace(text);
+                        accumulatedText.Add(cleanedText);
+
+                        var wordCount = accumulatedText.Sum(t => t.Split(' ').Length);
+                        if (wordCount >= 200)
+                        {
+                            await StoreAccumulatedChunksAsync();
+                        }
                     }
+                    // Don't recurse — already captured via InnerText
+                    return;
                 }
             }
 
@@ -217,16 +286,17 @@ public class WebsiteScrapingService
     {
         var embedding = await GenerateEmbedding(sentence);
 
+        var id = Guid.NewGuid().ToString();
         await db.AddEmbedding(new TextEmbeddingItem()
         {
-            Id = Guid.NewGuid().ToString(),
+            Id = id,
             Url = url,
             TextHash = ComputeHash(sentence),
             Text = sentence,
             Embedding = embedding
         });
 
-        Console.WriteLine($"Stored sentence: {sentence}.");
+        Console.WriteLine($"StoreChunk: {id} ({sentence.Length} chars) from {url}");
     }
 
     // Hash is used to check for duplicated text
